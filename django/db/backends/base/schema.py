@@ -19,6 +19,83 @@ from django.utils import timezone
 logger = logging.getLogger("django.db.backends.schema")
 
 
+class IndexNameTracker:
+    """
+    Index Name Tracker component providing bidirectional mapping storage 
+    between original auto-generated names and user-defined names throughout
+    migration lifecycles, supporting persistent state coordination.
+    """
+    
+    def __init__(self):
+        self._name_mappings = {}
+        self._reverse_mappings = {}
+    
+    def record_mapping(self, migration_id, model_table, original_name, renamed_name):
+        """
+        Record bidirectional mapping between original auto-generated name 
+        and user-defined name for reliable state tracking.
+        
+        Args:
+            migration_id: Migration identifier for state organization
+            model_table: Database table name containing the index
+            original_name: Original auto-generated index name
+            renamed_name: User-defined target index name
+        """
+        key = f"{migration_id}_{model_table}"
+        if key not in self._name_mappings:
+            self._name_mappings[key] = {}
+            self._reverse_mappings[key] = {}
+        
+        self._name_mappings[key][renamed_name] = original_name
+        self._reverse_mappings[key][original_name] = renamed_name
+        
+        logger.debug(
+            "Recorded index name mapping for %s: %s <-> %s", 
+            key, original_name, renamed_name
+        )
+    
+    def get_original_name(self, migration_id, model_table, renamed_name):
+        """
+        Retrieve original auto-generated name for restoration operations.
+        
+        Args:
+            migration_id: Migration identifier for state lookup
+            model_table: Database table name containing the index
+            renamed_name: User-defined index name to reverse
+            
+        Returns:
+            str: Original auto-generated name, or None if not found
+        """
+        key = f"{migration_id}_{model_table}"
+        original_name = self._name_mappings.get(key, {}).get(renamed_name)
+        
+        if original_name:
+            logger.debug(
+                "Retrieved original name for %s: %s <- %s", 
+                key, original_name, renamed_name
+            )
+        else:
+            logger.warning(
+                "No original name mapping found for %s: %s", 
+                key, renamed_name
+            )
+        
+        return original_name
+    
+    def clear_migration_mappings(self, migration_id, model_table):
+        """
+        Clear migration state mappings for cleanup operations.
+        
+        Args:
+            migration_id: Migration identifier for state cleanup
+            model_table: Database table name containing the index
+        """
+        key = f"{migration_id}_{model_table}"
+        self._name_mappings.pop(key, None)
+        self._reverse_mappings.pop(key, None)
+        logger.debug("Cleared index name mappings for %s", key)
+
+
 def _is_relevant_relation(relation, altered_field):
     """
     When altering the given field, must constraints on its model from the given
@@ -1715,149 +1792,6 @@ class BaseDatabaseSchemaEditor:
 
     def _collate_sql(self, collation):
         return "COLLATE " + self.quote_name(collation)
-
-    # Index Rename Utility Methods for Error Recovery and Validation
-
-    def validate_index_name_availability(self, model, proposed_name):
-        """
-        Validate that a proposed index name is available and doesn't conflict with 
-        existing database objects, implementing collision detection for fallback logic.
-        
-        Args:
-            model: Django model instance
-            proposed_name: Proposed index name to validate
-            
-        Returns:
-            bool: True if name is available, False if conflict exists
-        """
-        try:
-            # Check against existing indexes using database introspection
-            with self.connection.cursor() as cursor:
-                constraints = self.connection.introspection.get_constraints(
-                    cursor, model._meta.db_table
-                )
-                
-            # Check if proposed name conflicts with existing constraint names
-            existing_names = set(constraints.keys())
-            if proposed_name in existing_names:
-                logger.warning(
-                    "Index name conflict detected: %s already exists on table %s",
-                    proposed_name, model._meta.db_table
-                )
-                return False
-                
-            logger.debug(
-                "Validated index name availability: %s is available on table %s",
-                proposed_name, model._meta.db_table
-            )
-            return True
-            
-        except Exception as e:
-            logger.error(
-                "Failed to validate index name availability for %s on table %s. Error: %s",
-                proposed_name, model._meta.db_table, str(e)
-            )
-            # Conservative approach: assume name is not available on validation failure
-            return False
-
-    def generate_fallback_index_name(self, model, base_name, max_attempts=10):
-        """
-        Generate alternative index name with sequential suffixes when original names 
-        conflict with existing database objects, implementing fallback collision logic.
-        
-        Args:
-            model: Django model instance
-            base_name: Base name to modify with suffixes
-            max_attempts: Maximum number of suffix attempts
-            
-        Returns:
-            str: Available index name with suffix, or None if all attempts fail
-        """
-        try:
-            # First check if base name is available
-            if self.validate_index_name_availability(model, base_name):
-                return base_name
-                
-            # Generate names with sequential suffixes
-            for attempt in range(1, max_attempts + 1):
-                candidate_name = f"{base_name}_{attempt}"
-                
-                if self.validate_index_name_availability(model, candidate_name):
-                    logger.info(
-                        "Generated fallback index name: %s (attempt %d) for table %s",
-                        candidate_name, attempt, model._meta.db_table
-                    )
-                    return candidate_name
-                    
-            logger.error(
-                "Failed to generate fallback index name after %d attempts for base %s on table %s",
-                max_attempts, base_name, model._meta.db_table
-            )
-            return None
-            
-        except Exception as e:
-            logger.error(
-                "Error generating fallback index name for %s on table %s. Error: %s",
-                base_name, model._meta.db_table, str(e)
-            )
-            return None
-
-    def atomic_index_rename_operation(self, model, old_name, new_name):
-        """
-        Execute atomic index rename operation with proper error recovery and rollback
-        capabilities for complex rename sequences.
-        
-        Args:
-            model: Django model instance
-            old_name: Current index name
-            new_name: Target index name
-            
-        Returns:
-            bool: True if rename succeeded, False otherwise
-        """
-        try:
-            with atomic(using=self.connection.alias):
-                # Validate that old index exists
-                with self.connection.cursor() as cursor:
-                    constraints = self.connection.introspection.get_constraints(
-                        cursor, model._meta.db_table
-                    )
-                    
-                if old_name not in constraints:
-                    logger.error(
-                        "Cannot rename index %s: does not exist on table %s",
-                        old_name, model._meta.db_table
-                    )
-                    return False
-                    
-                # Validate that new name is available
-                if not self.validate_index_name_availability(model, new_name):
-                    logger.error(
-                        "Cannot rename index %s to %s: target name conflicts on table %s",
-                        old_name, new_name, model._meta.db_table
-                    )
-                    return False
-                    
-                # Execute the rename operation
-                rename_sql = self.sql_rename_index % {
-                    "old_name": self.quote_name(old_name),
-                    "new_name": self.quote_name(new_name)
-                }
-                
-                self.execute(rename_sql)
-                
-                logger.info(
-                    "Successfully renamed index %s to %s on table %s",
-                    old_name, new_name, model._meta.db_table
-                )
-                return True
-                
-        except Exception as e:
-            logger.error(
-                "Failed to rename index %s to %s on table %s. Error: %s",
-                old_name, new_name, model._meta.db_table, str(e)
-            )
-            return False
 
     def remove_procedure(self, procedure_name, param_types=()):
         sql = self.sql_delete_procedure % {
