@@ -876,8 +876,209 @@ class RemoveIndex(IndexOperation):
         return "remove_%s_%s" % (self.model_name_lower, self.name.lower())
 
 
+class MigrationStateTracker:
+    """
+    Migration State Tracker component providing persistent bidirectional mapping
+    between original auto-generated names and user-defined names throughout 
+    migration lifecycles, enabling reliable backward migration execution.
+    """
+    
+    def __init__(self):
+        self._state_cache = {}
+    
+    def record_mapping(self, migration_name, model_name, original_name, new_name):
+        """
+        Record bidirectional mapping between original auto-generated name 
+        and user-defined name for reliable backward migration support.
+        
+        Args:
+            migration_name: Migration identifier for state organization
+            model_name: Model containing the index
+            original_name: Original auto-generated index name
+            new_name: User-defined target index name
+        """
+        key = f"{migration_name}_{model_name}"
+        if key not in self._state_cache:
+            self._state_cache[key] = {}
+        
+        self._state_cache[key][new_name] = original_name
+        logger.debug(
+            "Recorded index mapping for %s: %s -> %s", 
+            key, original_name, new_name
+        )
+    
+    def retrieve_original_name(self, migration_name, model_name, new_name):
+        """
+        Retrieve original auto-generated name for backward migration operation.
+        
+        Args:
+            migration_name: Migration identifier for state lookup
+            model_name: Model containing the index
+            new_name: User-defined index name to reverse
+            
+        Returns:
+            str: Original auto-generated name, or None if not found
+        """
+        key = f"{migration_name}_{model_name}"
+        original_name = self._state_cache.get(key, {}).get(new_name)
+        
+        if original_name:
+            logger.debug(
+                "Retrieved original name for %s: %s <- %s", 
+                key, original_name, new_name
+            )
+        else:
+            logger.warning(
+                "No original name mapping found for %s: %s", 
+                key, new_name
+            )
+        
+        return original_name
+    
+    def clear_migration_state(self, migration_name, model_name):
+        """
+        Clear migration state for cleanup operations after successful completion.
+        
+        Args:
+            migration_name: Migration identifier for state cleanup
+            model_name: Model containing the index
+        """
+        key = f"{migration_name}_{model_name}"
+        if key in self._state_cache:
+            del self._state_cache[key]
+            logger.debug("Cleared migration state for %s", key)
+
+
+class IndexNameGenerator:
+    """
+    Index Name Generator component computing and restoring auto-generated 
+    index names using Django's internal naming algorithms, analyzing 
+    constraint metadata to reconstruct precise original names for unnamed indexes.
+    """
+    
+    def compute_original_name(self, model, fields, schema_editor):
+        """
+        Reconstruct auto-generated index name using Django's internal naming algorithms.
+        
+        Args:
+            model: Django model instance
+            fields: Field names used in the index
+            schema_editor: Database schema editor for name generation
+            
+        Returns:
+            str: Reconstructed auto-generated index name
+        """
+        try:
+            # Get field columns for name generation
+            columns = [model._meta.get_field(field).column for field in fields]
+            
+            # Use Django's internal _create_index_name method to reconstruct
+            original_name = schema_editor._create_index_name(
+                model._meta.db_table, columns, suffix="_idx"
+            )
+            
+            logger.debug(
+                "Computed original name for %s.%s: %s", 
+                model._meta.db_table, fields, original_name
+            )
+            return original_name
+            
+        except Exception as e:
+            logger.error(
+                "Failed to compute original name for %s.%s: %s", 
+                model._meta.db_table, fields, str(e)
+            )
+            return None
+    
+    def validate_name_uniqueness(self, model, proposed_name, schema_editor):
+        """
+        Validate that proposed index name doesn't conflict with existing database objects.
+        
+        Args:
+            model: Django model instance
+            proposed_name: Index name to validate
+            schema_editor: Database schema editor for validation
+            
+        Returns:
+            bool: True if name is available, False if conflict exists
+        """
+        try:
+            # Use schema editor's validation method if available
+            if hasattr(schema_editor, 'validate_index_name_availability'):
+                return schema_editor.validate_index_name_availability(model, proposed_name)
+            
+            # Fallback validation using constraint introspection
+            with schema_editor.connection.cursor() as cursor:
+                constraints = schema_editor.connection.introspection.get_constraints(
+                    cursor, model._meta.db_table
+                )
+            
+            return proposed_name not in constraints
+            
+        except Exception as e:
+            logger.error(
+                "Failed to validate name uniqueness for %s: %s", 
+                proposed_name, str(e)
+            )
+            return False
+    
+    def analyze_constraint_origin(self, model, index_name, schema_editor):
+        """
+        Analyze constraint metadata to identify index creation source.
+        
+        Args:
+            model: Django model instance
+            index_name: Index name to analyze
+            schema_editor: Database schema editor for introspection
+            
+        Returns:
+            dict: Constraint origin metadata including creation source
+        """
+        try:
+            with schema_editor.connection.cursor() as cursor:
+                constraints = schema_editor.connection.introspection.get_constraints(
+                    cursor, model._meta.db_table
+                )
+            
+            if index_name in constraints:
+                constraint_info = constraints[index_name]
+                origin_info = {
+                    'columns': constraint_info.get('columns', []),
+                    'unique': constraint_info.get('unique', False),
+                    'index': constraint_info.get('index', False),
+                    'primary_key': constraint_info.get('primary_key', False),
+                    'source': 'unknown'
+                }
+                
+                # Analyze if this matches unique_together pattern
+                if constraint_info.get('unique', False) and len(constraint_info.get('columns', [])) > 1:
+                    origin_info['source'] = 'unique_together'
+                elif constraint_info.get('index', False):
+                    origin_info['source'] = 'index_together'
+                
+                logger.debug(
+                    "Analyzed constraint origin for %s: %s", 
+                    index_name, origin_info
+                )
+                return origin_info
+            
+            logger.warning("Constraint not found for analysis: %s", index_name)
+            return {}
+            
+        except Exception as e:
+            logger.error(
+                "Failed to analyze constraint origin for %s: %s", 
+                index_name, str(e)
+            )
+            return {}
+
+
 class RenameIndex(IndexOperation):
-    """Rename an index."""
+    """
+    Enhanced RenameIndex operation implementing forward and backward rename logic 
+    for Django database indexes, with specialized handling for unnamed indexes 
+    created by unique_together constraints through Migration State Tracker coordination.
+    """
 
     def __init__(self, model_name, new_name, old_name=None, old_fields=None):
         if not old_name and not old_fields:
@@ -893,10 +1094,15 @@ class RenameIndex(IndexOperation):
         self.new_name = new_name
         self.old_name = old_name
         self.old_fields = old_fields
+        
+        # Initialize enhanced components for unnamed index handling
+        self._state_tracker = MigrationStateTracker()
+        self._name_generator = IndexNameGenerator()
+        self._original_auto_name = None  # Store computed original name
 
     @cached_property
     def old_name_lower(self):
-        return self.old_name.lower()
+        return self.old_name.lower() if self.old_name else None
 
     @cached_property
     def new_name_lower(self):
@@ -931,58 +1137,315 @@ class RenameIndex(IndexOperation):
                 app_label, self.model_name_lower, self.old_name, self.new_name
             )
 
+    def validate_rename_target(self, model, schema_editor):
+        """
+        Pre-execution validation of index rename operations, including 
+        duplicate detection and naming conflict prevention.
+        
+        Args:
+            model: Django model instance
+            schema_editor: Database schema editor for validation
+            
+        Returns:
+            bool: True if rename operation is valid, False otherwise
+        """
+        try:
+            # Validate new name doesn't conflict with existing objects
+            if not self._name_generator.validate_name_uniqueness(
+                model, self.new_name, schema_editor
+            ):
+                logger.error(
+                    "Index rename validation failed: target name %s conflicts with existing object on %s",
+                    self.new_name, model._meta.db_table
+                )
+                return False
+            
+            # For unnamed indexes, validate we can compute original name
+            if self.old_fields:
+                original_name = self._name_generator.compute_original_name(
+                    model, self.old_fields, schema_editor
+                )
+                if not original_name:
+                    logger.error(
+                        "Index rename validation failed: cannot compute original name for unnamed index on %s.%s",
+                        model._meta.db_table, self.old_fields
+                    )
+                    return False
+                
+                self._original_auto_name = original_name
+            
+            logger.debug(
+                "Index rename validation successful for %s on %s",
+                self.new_name, model._meta.db_table
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(
+                "Index rename validation failed for %s on %s: %s",
+                self.new_name, model._meta.db_table, str(e)
+            )
+            return False
+
+    def execute_forward(self, app_label, schema_editor, from_state, to_state, migration_name=None):
+        """
+        Execute forward migration with state initialization, unnamed index detection,
+        and mapping preservation through Migration State Tracker coordination.
+        
+        Args:
+            app_label: Application label for model resolution
+            schema_editor: Database schema editor for operations
+            from_state: Migration state before operation
+            to_state: Migration state after operation
+            migration_name: Migration identifier for state tracking
+            
+        Returns:
+            bool: True if forward execution succeeded, False otherwise
+        """
+        try:
+            model = to_state.apps.get_model(app_label, self.model_name)
+            
+            # Pre-execution validation
+            if not self.validate_rename_target(model, schema_editor):
+                return False
+            
+            # Handle unnamed index scenario (old_fields specified)
+            if self.old_fields:
+                logger.info(
+                    "Executing forward rename for unnamed index on %s.%s -> %s",
+                    model._meta.db_table, self.old_fields, self.new_name
+                )
+                
+                from_model = from_state.apps.get_model(app_label, self.model_name)
+                columns = [
+                    from_model._meta.get_field(field).column for field in self.old_fields
+                ]
+                
+                # Find the auto-generated index name
+                matching_index_names = schema_editor._constraint_names(
+                    from_model, column_names=columns, index=True
+                )
+                
+                if len(matching_index_names) != 1:
+                    logger.error(
+                        "Found wrong number (%s) of indexes for %s(%s)",
+                        len(matching_index_names),
+                        from_model._meta.db_table,
+                        ", ".join(columns)
+                    )
+                    return False
+                
+                actual_old_name = matching_index_names[0]
+                
+                # Record state mapping for backward migration
+                if migration_name:
+                    self._state_tracker.record_mapping(
+                        migration_name, self.model_name, actual_old_name, self.new_name
+                    )
+                
+                # Create index objects for rename operation
+                old_index = models.Index(fields=self.old_fields, name=actual_old_name)
+                to_model_state = to_state.models[app_label, self.model_name_lower]
+                new_index = to_model_state.get_index_by_name(self.new_name)
+                
+                # Execute rename with transaction safety
+                with atomic(using=schema_editor.connection.alias):
+                    schema_editor.rename_index(model, old_index, new_index)
+                
+            else:
+                # Handle named index scenario (standard case)
+                logger.info(
+                    "Executing forward rename for named index %s -> %s on %s",
+                    self.old_name, self.new_name, model._meta.db_table
+                )
+                
+                from_model_state = from_state.models[app_label, self.model_name_lower]
+                old_index = from_model_state.get_index_by_name(self.old_name)
+                to_model_state = to_state.models[app_label, self.model_name_lower]
+                new_index = to_model_state.get_index_by_name(self.new_name)
+                
+                # Execute rename with transaction safety
+                with atomic(using=schema_editor.connection.alias):
+                    schema_editor.rename_index(model, old_index, new_index)
+            
+            logger.info(
+                "Forward index rename completed successfully for %s on %s",
+                self.new_name, model._meta.db_table
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(
+                "Forward index rename failed for %s on %s: %s",
+                self.new_name, getattr(model, '_meta', {}).get('db_table', 'unknown'), str(e)
+            )
+            return False
+
+    def execute_backward(self, app_label, schema_editor, from_state, to_state, migration_name=None):
+        """
+        Execute backward migration with original name restoration, conflict resolution,
+        and state cleanup mechanisms.
+        
+        Args:
+            app_label: Application label for model resolution
+            schema_editor: Database schema editor for operations
+            from_state: Migration state before rollback
+            to_state: Migration state after rollback
+            migration_name: Migration identifier for state tracking
+            
+        Returns:
+            bool: True if backward execution succeeded, False otherwise
+        """
+        try:
+            model = to_state.apps.get_model(app_label, self.model_name)
+            
+            # Handle unnamed index rollback scenario
+            if self.old_fields:
+                logger.info(
+                    "Executing backward migration for unnamed index %s -> original on %s.%s",
+                    self.new_name, model._meta.db_table, self.old_fields
+                )
+                
+                # Retrieve original auto-generated name from state tracker
+                original_name = None
+                if migration_name:
+                    original_name = self._state_tracker.retrieve_original_name(
+                        migration_name, self.model_name, self.new_name
+                    )
+                
+                # If no state record, compute original name using name generator
+                if not original_name:
+                    logger.warning(
+                        "No state record found for %s, computing original name",
+                        self.new_name
+                    )
+                    original_name = self._name_generator.compute_original_name(
+                        model, self.old_fields, schema_editor
+                    )
+                
+                if not original_name:
+                    logger.error(
+                        "Cannot determine original name for unnamed index rollback: %s on %s.%s",
+                        self.new_name, model._meta.db_table, self.old_fields
+                    )
+                    return False
+                
+                # Check if original name would conflict
+                if not self._name_generator.validate_name_uniqueness(
+                    model, original_name, schema_editor
+                ):
+                    logger.warning(
+                        "Original name %s conflicts with existing object, attempting fallback",
+                        original_name
+                    )
+                    
+                    # Use schema editor's fallback generation if available
+                    if hasattr(schema_editor, 'generate_fallback_index_name'):
+                        original_name = schema_editor.generate_fallback_index_name(
+                            model, original_name
+                        )
+                        if not original_name:
+                            logger.error(
+                                "Cannot resolve naming conflict for unnamed index rollback"
+                            )
+                            return False
+                
+                # Create index objects for rollback rename
+                current_index = models.Index(fields=self.old_fields, name=self.new_name)
+                restored_index = models.Index(fields=self.old_fields, name=original_name)
+                
+                # Execute rollback rename with transaction safety
+                with atomic(using=schema_editor.connection.alias):
+                    schema_editor.rename_index(model, current_index, restored_index)
+                
+                # Clean up state tracking after successful rollback
+                if migration_name:
+                    self._state_tracker.clear_migration_state(migration_name, self.model_name)
+                
+            else:
+                # Handle named index rollback (standard case) 
+                logger.info(
+                    "Executing backward migration for named index %s -> %s on %s",
+                    self.new_name, self.old_name, model._meta.db_table
+                )
+                
+                # Create index objects with swapped names for rollback
+                current_index = models.Index(fields=[], name=self.new_name)  
+                restored_index = models.Index(fields=[], name=self.old_name)
+                
+                # Execute rollback rename with transaction safety
+                with atomic(using=schema_editor.connection.alias):
+                    schema_editor.rename_index(model, current_index, restored_index)
+            
+            logger.info(
+                "Backward index rename completed successfully for %s on %s",
+                self.new_name, model._meta.db_table
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(
+                "Backward index rename failed for %s on %s: %s",
+                self.new_name, getattr(model, '_meta', {}).get('db_table', 'unknown'), str(e)
+            )
+            return False
+
     def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        """
+        Enhanced database_forwards method implementing state tracking for original
+        auto-generated names before rename execution, handling previously unnamed 
+        indexes correctly with Migration State Tracker coordination.
+        """
         model = to_state.apps.get_model(app_label, self.model_name)
         if not self.allow_migrate_model(schema_editor.connection.alias, model):
             return
 
-        if self.old_fields:
-            from_model = from_state.apps.get_model(app_label, self.model_name)
-            columns = [
-                from_model._meta.get_field(field).column for field in self.old_fields
-            ]
-            matching_index_name = schema_editor._constraint_names(
-                from_model, column_names=columns, index=True
+        # Extract migration name from schema editor or current migration context
+        migration_name = getattr(schema_editor, '_current_migration_name', None)
+        
+        # Use enhanced forward execution method
+        success = self.execute_forward(
+            app_label, schema_editor, from_state, to_state, migration_name
+        )
+        
+        if not success:
+            raise ValueError(
+                f"Failed to execute forward rename operation for index {self.new_name} "
+                f"on {model._meta.db_table}"
             )
-            if len(matching_index_name) != 1:
-                raise ValueError(
-                    "Found wrong number (%s) of indexes for %s(%s)."
-                    % (
-                        len(matching_index_name),
-                        from_model._meta.db_table,
-                        ", ".join(columns),
-                    )
-                )
-            old_index = models.Index(
-                fields=self.old_fields,
-                name=matching_index_name[0],
-            )
-        else:
-            from_model_state = from_state.models[app_label, self.model_name_lower]
-            old_index = from_model_state.get_index_by_name(self.old_name)
-
-        to_model_state = to_state.models[app_label, self.model_name_lower]
-        new_index = to_model_state.get_index_by_name(self.new_name)
-        schema_editor.rename_index(model, old_index, new_index)
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        if self.old_fields:
-            # Backward operation with unnamed index is a no-op.
+        """
+        Enhanced database_backwards method with unnamed index detection and 
+        auto-generated name restoration capabilities, implementing state tracking 
+        for reliable restoration of original unnamed indexes created by unique_together constraints.
+        """
+        model = to_state.apps.get_model(app_label, self.model_name)
+        if not self.allow_migrate_model(schema_editor.connection.alias, model):
             return
 
-        self.new_name_lower, self.old_name_lower = (
-            self.old_name_lower,
-            self.new_name_lower,
+        # Extract migration name from schema editor or current migration context  
+        migration_name = getattr(schema_editor, '_current_migration_name', None)
+        
+        # Use enhanced backward execution method
+        success = self.execute_backward(
+            app_label, schema_editor, from_state, to_state, migration_name
         )
-        self.new_name, self.old_name = self.old_name, self.new_name
-
-        self.database_forwards(app_label, schema_editor, from_state, to_state)
-
-        self.new_name_lower, self.old_name_lower = (
-            self.old_name_lower,
-            self.new_name_lower,
-        )
-        self.new_name, self.old_name = self.old_name, self.new_name
+        
+        if not success:
+            # For unnamed indexes, provide more specific error context
+            if self.old_fields:
+                raise ValueError(
+                    f"Failed to execute backward rename operation for unnamed index {self.new_name} "
+                    f"on {model._meta.db_table}. This may be due to PostgreSQL duplicate index "
+                    f"constraints when restoring auto-generated names from unique_together. "
+                    f"Original fields: {self.old_fields}"
+                )
+            else:
+                raise ValueError(
+                    f"Failed to execute backward rename operation for index {self.new_name} "
+                    f"on {model._meta.db_table}"
+                )
 
     def describe(self):
         if self.old_name:
