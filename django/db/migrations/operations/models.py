@@ -967,7 +967,27 @@ class RenameIndex(IndexOperation):
 
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         if self.old_fields:
-            # Backward operation with unnamed index is a no-op.
+            # For unnamed indexes (created from index_together), we need to:
+            # 1. Remove the named index that was created in the forward operation
+            # 2. Restore the original index_together constraint
+            model = to_state.apps.get_model(app_label, self.model_name)
+            if self.allow_migrate_model(schema_editor.connection.alias, model):
+                # Get the named index from the from_state (current state before reversal)
+                from_model_state = from_state.models[app_label, self.model_name_lower]
+                named_index = from_model_state.get_index_by_name(self.new_name)
+                
+                # Remove the named index
+                schema_editor.remove_index(model, named_index)
+                
+                # Restore the index_together constraint
+                # Get the old and new index_together values from model metadata
+                old_model = from_state.apps.get_model(app_label, self.model_name)
+                new_model = to_state.apps.get_model(app_label, self.model_name)
+                schema_editor.alter_index_together(
+                    model,
+                    getattr(old_model._meta, 'index_together', set()),
+                    getattr(new_model._meta, 'index_together', set()),
+                )
             return
 
         self.new_name_lower, self.old_name_lower = (
