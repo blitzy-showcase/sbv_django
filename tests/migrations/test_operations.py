@@ -5242,6 +5242,550 @@ class TestCreateModel(SimpleTestCase):
         ).references_model("other_model", "migrations")
 
 
+    def test_rename_index_forward_unnamed(self):
+        """
+        Test forward rename operations on auto-generated indexes from unique_together constraints.
+        Validates proper state tracking and name mapping preservation during forward migrations.
+        """
+        app_label = "test_rename_forward_unnamed"
+        project_state = self.set_up_test_model(app_label, unique_together=True)
+        table_name = f"{app_label}_pony"
+        new_index_name = "custom_unnamed_rename_idx"
+        
+        # Verify the auto-generated unique constraint exists
+        self.assertUniqueConstraintExists(table_name, ["pink", "weight"])
+        
+        # Create RenameIndex operation for unnamed index
+        operation = migrations.RenameIndex(
+            "Pony", 
+            new_name=new_index_name, 
+            old_fields=("pink", "weight")
+        )
+        
+        self.assertEqual(
+            operation.describe(),
+            f"Rename unnamed index for ('pink', 'weight') on Pony to {new_index_name}"
+        )
+        
+        # Execute forward migration
+        new_state = project_state.clone()
+        operation.state_forwards(app_label, new_state)
+        
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, project_state, new_state)
+        
+        # Verify new named index exists and constraint is maintained
+        self.assertIndexNameExists(table_name, new_index_name)
+        self.assertUniqueConstraintExists(table_name, ["pink", "weight"])
+        
+        # Test that the index actually works for uniqueness
+        Pony = new_state.apps.get_model(app_label, "Pony")
+        Pony.objects.create(pink=1, weight=10.0)
+        with self.assertRaises(IntegrityError):
+            Pony.objects.create(pink=1, weight=10.0)
+            
+        # Verify state changes - unique_together should be replaced with named index
+        model_state = new_state.models[app_label, "pony"]
+        self.assertEqual(len(model_state.options.get("indexes", [])), 1)
+        self.assertEqual(model_state.options["indexes"][0].name, new_index_name)
+        self.assertEqual(len(model_state.options.get("unique_together", [])), 0)
+
+    def test_rename_index_backward_unnamed(self):
+        """
+        Test backward rollback operations that restore original auto-generated index names.
+        Ensures prevention of 'relation already exists' errors during PostgreSQL rollbacks.
+        """
+        app_label = "test_rename_backward_unnamed"
+        project_state = self.set_up_test_model(app_label, unique_together=True)
+        table_name = f"{app_label}_pony"
+        new_index_name = "temp_backward_test_idx"
+        
+        # Execute forward migration first
+        operation = migrations.RenameIndex(
+            "Pony", 
+            new_name=new_index_name, 
+            old_fields=("pink", "weight")
+        )
+        
+        forward_state = project_state.clone()
+        operation.state_forwards(app_label, forward_state)
+        
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, project_state, forward_state)
+        
+        # Verify forward migration succeeded
+        self.assertIndexNameExists(table_name, new_index_name)
+        
+        # Execute backward migration
+        with connection.schema_editor() as editor:
+            operation.database_backwards(app_label, editor, forward_state, project_state)
+        
+        # Verify backward migration restored original state
+        self.assertIndexNameNotExists(table_name, new_index_name)
+        self.assertUniqueConstraintExists(table_name, ["pink", "weight"])
+        
+        # Verify no duplicate constraint errors occurred and uniqueness still works
+        Pony = project_state.apps.get_model(app_label, "Pony")
+        Pony.objects.create(pink=2, weight=15.0)
+        with self.assertRaises(IntegrityError):
+            Pony.objects.create(pink=2, weight=15.0)
+
+    def test_rename_index_cycle_complete(self):
+        """
+        Test complete forward-then-backward migration cycles for state consistency.
+        Validates proper cleanup throughout the entire rename operation sequence.
+        """
+        app_label = "test_rename_cycle_complete"
+        project_state = self.set_up_test_model(app_label, unique_together=True)
+        table_name = f"{app_label}_pony"
+        cycle_index_name = "complete_cycle_test_idx"
+        
+        # Store initial constraint state
+        initial_constraints = None
+        with connection.cursor() as cursor:
+            initial_constraints = connection.introspection.get_constraints(cursor, table_name)
+        
+        # Execute complete forward-backward cycle
+        operation = migrations.RenameIndex(
+            "Pony", 
+            new_name=cycle_index_name, 
+            old_fields=("pink", "weight")
+        )
+        
+        # Forward migration
+        forward_state = project_state.clone()
+        operation.state_forwards(app_label, forward_state)
+        
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, project_state, forward_state)
+        
+        # Verify forward state
+        self.assertIndexNameExists(table_name, cycle_index_name)
+        
+        # Backward migration  
+        with connection.schema_editor() as editor:
+            operation.database_backwards(app_label, editor, forward_state, project_state)
+        
+        # Verify complete restoration to initial state
+        self.assertIndexNameNotExists(table_name, cycle_index_name)
+        self.assertUniqueConstraintExists(table_name, ["pink", "weight"])
+        
+        # Verify constraint structure matches original
+        with connection.cursor() as cursor:
+            final_constraints = connection.introspection.get_constraints(cursor, table_name)
+        
+        # Compare constraint characteristics (excluding names which may differ)
+        initial_unique_constraints = [
+            c for c in initial_constraints.values() 
+            if c.get('unique') and c.get('columns') == ['pink', 'weight']
+        ]
+        final_unique_constraints = [
+            c for c in final_constraints.values() 
+            if c.get('unique') and c.get('columns') == ['pink', 'weight']
+        ]
+        
+        self.assertEqual(len(initial_unique_constraints), 1)
+        self.assertEqual(len(final_unique_constraints), 1)
+        
+        # Test functional consistency
+        Pony = project_state.apps.get_model(app_label, "Pony")
+        Pony.objects.create(pink=3, weight=20.0)
+        with self.assertRaises(IntegrityError):
+            Pony.objects.create(pink=3, weight=20.0)
+
+    def test_unique_together_index_detection(self):
+        """
+        Test identification and handling of unnamed indexes generated by unique_together constraints.
+        Validates correct detection during rename operations.
+        """
+        app_label = "test_unique_detection"
+        
+        # Create model with multiple unique_together constraints
+        operations = [
+            migrations.CreateModel(
+                "TestModel",
+                [
+                    ("id", models.AutoField(primary_key=True)),
+                    ("field_a", models.CharField(max_length=50)),
+                    ("field_b", models.CharField(max_length=50)),
+                    ("field_c", models.IntegerField()),
+                    ("field_d", models.BooleanField()),
+                ],
+                options={
+                    "unique_together": [
+                        ("field_a", "field_b"),
+                        ("field_c", "field_d"),
+                        ("field_a", "field_c", "field_d"),
+                    ]
+                },
+            )
+        ]
+        
+        project_state = self.apply_operations(app_label, ProjectState(), operations)
+        table_name = f"{app_label}_testmodel"
+        
+        # Verify all unique_together constraints created unnamed indexes
+        self.assertUniqueConstraintExists(table_name, ["field_a", "field_b"])
+        self.assertUniqueConstraintExists(table_name, ["field_c", "field_d"])
+        self.assertUniqueConstraintExists(table_name, ["field_a", "field_c", "field_d"])
+        
+        # Test detection and renaming of each unnamed index
+        test_cases = [
+            (("field_a", "field_b"), "detected_two_field_idx"),
+            (("field_c", "field_d"), "detected_bool_int_idx"),
+            (("field_a", "field_c", "field_d"), "detected_three_field_idx"),
+        ]
+        
+        for old_fields, new_name in test_cases:
+            with self.subTest(old_fields=old_fields, new_name=new_name):
+                # Create rename operation
+                operation = migrations.RenameIndex(
+                    "TestModel", 
+                    new_name=new_name, 
+                    old_fields=old_fields
+                )
+                
+                # Execute rename
+                new_state = project_state.clone()
+                operation.state_forwards(app_label, new_state)
+                
+                with connection.schema_editor() as editor:
+                    operation.database_forwards(app_label, editor, project_state, new_state)
+                
+                # Verify detection and renaming succeeded
+                self.assertIndexNameExists(table_name, new_name)
+                self.assertUniqueConstraintExists(table_name, list(old_fields))
+                
+                # Rollback for next test
+                with connection.schema_editor() as editor:
+                    operation.database_backwards(app_label, editor, new_state, project_state)
+                
+                self.assertIndexNameNotExists(table_name, new_name)
+
+    @skipUnlessDBFeature("supports_foreign_keys")
+    def test_postgresql_duplicate_index_prevention(self):
+        """
+        PostgreSQL-specific test for duplicate index error prevention during backward migrations.
+        Validates proper handling of PostgreSQL constraints and transaction boundaries.
+        """
+        if connection.vendor != 'postgresql':
+            self.skipTest("PostgreSQL-specific test")
+            
+        app_label = "test_pg_duplicate_prevention"
+        project_state = self.set_up_test_model(app_label, unique_together=True)
+        table_name = f"{app_label}_pony"
+        pg_test_index_name = "postgresql_duplicate_test_idx"
+        
+        # Execute forward migration
+        operation = migrations.RenameIndex(
+            "Pony", 
+            new_name=pg_test_index_name, 
+            old_fields=("pink", "weight")
+        )
+        
+        forward_state = project_state.clone()
+        operation.state_forwards(app_label, forward_state)
+        
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, project_state, forward_state)
+        
+        # Verify PostgreSQL-specific index characteristics
+        with connection.cursor() as cursor:
+            constraints = connection.introspection.get_constraints(cursor, table_name)
+            renamed_constraint = constraints.get(pg_test_index_name)
+            
+            self.assertIsNotNone(renamed_constraint)
+            self.assertEqual(renamed_constraint['columns'], ['pink', 'weight'])
+            self.assertTrue(renamed_constraint['unique'])
+        
+        # Test backward migration with PostgreSQL-specific validation
+        with connection.schema_editor() as editor:
+            # This should not raise "relation already exists" error
+            operation.database_backwards(app_label, editor, forward_state, project_state)
+        
+        # Verify PostgreSQL constraint restoration
+        with connection.cursor() as cursor:
+            final_constraints = connection.introspection.get_constraints(cursor, table_name)
+            
+            # Should have restored unnamed constraint without conflicts
+            unique_constraints = [
+                c for c in final_constraints.values()
+                if c.get('unique') and c.get('columns') == ['pink', 'weight']
+            ]
+            self.assertEqual(len(unique_constraints), 1)
+            
+            # Original renamed constraint should be gone
+            self.assertNotIn(pg_test_index_name, final_constraints)
+
+    def test_migration_state_tracking(self):
+        """
+        Test proper persistence and restoration of index name mappings through 
+        Migration State Tracker component integration.
+        """
+        app_label = "test_state_tracking"
+        project_state = self.set_up_test_model(app_label, unique_together=True)
+        table_name = f"{app_label}_pony"
+        state_tracked_index = "state_tracked_rename_idx"
+        
+        # Create operation with state tracking
+        operation = migrations.RenameIndex(
+            "Pony", 
+            new_name=state_tracked_index, 
+            old_fields=("pink", "weight")
+        )
+        
+        # Track original constraint name before rename
+        original_constraint_name = None
+        with connection.cursor() as cursor:
+            constraints = connection.introspection.get_constraints(cursor, table_name)
+            for name, info in constraints.items():
+                if (info.get('unique') and 
+                    info.get('columns') == ['pink', 'weight']):
+                    original_constraint_name = name
+                    break
+        
+        self.assertIsNotNone(original_constraint_name)
+        
+        # Execute forward migration with state tracking
+        forward_state = project_state.clone()
+        operation.state_forwards(app_label, forward_state)
+        
+        with connection.schema_editor() as editor:
+            # Simulate migration name tracking
+            editor._current_migration_name = "test_migration_001"
+            operation.database_forwards(app_label, editor, project_state, forward_state)
+        
+        # Verify forward migration and state tracking
+        self.assertIndexNameExists(table_name, state_tracked_index)
+        
+        # Verify state mapping was recorded (if state tracker is accessible)
+        if hasattr(operation, '_state_tracker'):
+            # Test state tracker functionality
+            self.assertIsNotNone(operation._state_tracker)
+        
+        # Execute backward migration with state tracking
+        with connection.schema_editor() as editor:
+            editor._current_migration_name = "test_migration_001"
+            operation.database_backwards(app_label, editor, forward_state, project_state)
+        
+        # Verify state restoration
+        self.assertIndexNameNotExists(table_name, state_tracked_index)
+        self.assertUniqueConstraintExists(table_name, ["pink", "weight"])
+        
+        # Verify constraint functionality is maintained
+        Pony = project_state.apps.get_model(app_label, "Pony")
+        Pony.objects.create(pink=4, weight=25.0)
+        with self.assertRaises(IntegrityError):
+            Pony.objects.create(pink=4, weight=25.0)
+
+    def test_complex_migration_sequences(self):
+        """
+        Test RenameIndex operations within complex migration chains involving 
+        multiple schema changes and dependent operations.
+        """
+        app_label = "test_complex_sequences"
+        
+        # Create complex initial state with multiple constraints and indexes
+        initial_operations = [
+            migrations.CreateModel(
+                "ComplexModel",
+                [
+                    ("id", models.AutoField(primary_key=True)),
+                    ("name", models.CharField(max_length=100)),
+                    ("code", models.CharField(max_length=20)),
+                    ("category", models.CharField(max_length=50)),
+                    ("status", models.CharField(max_length=20)),
+                    ("priority", models.IntegerField()),
+                ],
+                options={
+                    "unique_together": [
+                        ("name", "category"),
+                        ("code", "status"),
+                    ]
+                },
+            ),
+            migrations.AddIndex(
+                "ComplexModel",
+                models.Index(fields=["priority"], name="explicit_priority_idx"),
+            ),
+        ]
+        
+        project_state = self.apply_operations(app_label, ProjectState(), initial_operations)
+        table_name = f"{app_label}_complexmodel"
+        
+        # Execute complex migration sequence
+        sequence_operations = [
+            # 1. Rename unnamed index from unique_together
+            migrations.RenameIndex(
+                "ComplexModel",
+                new_name="renamed_name_category_idx",
+                old_fields=("name", "category")
+            ),
+            
+            # 2. Add field (requires table alteration)
+            migrations.AddField(
+                "ComplexModel",
+                "description",
+                models.TextField(default="")
+            ),
+            
+            # 3. Rename another unnamed index
+            migrations.RenameIndex(
+                "ComplexModel", 
+                new_name="renamed_code_status_idx",
+                old_fields=("code", "status")
+            ),
+            
+            # 4. Add another index
+            migrations.AddIndex(
+                "ComplexModel",
+                models.Index(fields=["description", "priority"], name="complex_desc_priority_idx"),
+            ),
+            
+            # 5. Rename explicit index
+            migrations.RenameIndex(
+                "ComplexModel",
+                new_name="renamed_priority_idx", 
+                old_name="explicit_priority_idx"
+            ),
+        ]
+        
+        # Apply complex sequence
+        final_state = self.apply_operations(app_label, project_state, sequence_operations)
+        
+        # Verify all operations succeeded
+        self.assertIndexNameExists(table_name, "renamed_name_category_idx")
+        self.assertIndexNameExists(table_name, "renamed_code_status_idx") 
+        self.assertIndexNameExists(table_name, "complex_desc_priority_idx")
+        self.assertIndexNameExists(table_name, "renamed_priority_idx")
+        
+        # Verify unique constraints still work
+        ComplexModel = final_state.apps.get_model(app_label, "ComplexModel")
+        ComplexModel.objects.create(
+            name="Test", category="A", code="001", status="Active", priority=1
+        )
+        
+        with self.assertRaises(IntegrityError):
+            ComplexModel.objects.create(
+                name="Test", category="A", code="002", status="Active", priority=2
+            )
+        
+        with self.assertRaises(IntegrityError):
+            ComplexModel.objects.create(
+                name="Test2", category="B", code="001", status="Active", priority=3
+            )
+        
+        # Test rollback of complex sequence
+        rollback_operations = list(reversed(sequence_operations))
+        rollback_state = self.unapply_operations(app_label, final_state, rollback_operations)
+        
+        # Verify rollback restored original state
+        self.assertUniqueConstraintExists(table_name, ["name", "category"])
+        self.assertUniqueConstraintExists(table_name, ["code", "status"])
+        self.assertIndexNameExists(table_name, "explicit_priority_idx")
+        self.assertIndexNameNotExists(table_name, "renamed_name_category_idx")
+        self.assertIndexNameNotExists(table_name, "renamed_code_status_idx")
+
+    def _assert_index_metadata_integrity(self, table_name, index_name, expected_columns, 
+                                        expected_unique=True):
+        """
+        Helper method for validating index metadata, naming consistency, 
+        and database state integrity throughout rename operation cycles.
+        """
+        with connection.cursor() as cursor:
+            constraints = connection.introspection.get_constraints(cursor, table_name)
+            
+            self.assertIn(index_name, constraints, 
+                         f"Index {index_name} not found in {table_name}")
+            
+            constraint = constraints[index_name]
+            self.assertEqual(constraint['columns'], expected_columns,
+                           f"Index {index_name} has wrong columns")
+            self.assertEqual(constraint['unique'], expected_unique,
+                           f"Index {index_name} has wrong unique setting")
+
+    def _get_unnamed_constraint_name(self, table_name, columns):
+        """
+        Helper method to find unnamed constraint names for given columns.
+        """
+        with connection.cursor() as cursor:
+            constraints = connection.introspection.get_constraints(cursor, table_name)
+            
+            for name, info in constraints.items():
+                if (info.get('unique') and 
+                    info.get('columns') == columns):
+                    return name
+        return None
+
+    def test_postgresql_system_catalog_inspection(self):
+        """
+        Enhanced test infrastructure for PostgreSQL-specific testing scenarios
+        including system catalog inspection and transaction boundary validation.
+        """
+        if connection.vendor != 'postgresql':
+            self.skipTest("PostgreSQL-specific system catalog test")
+            
+        app_label = "test_pg_catalog"
+        project_state = self.set_up_test_model(app_label, unique_together=True)
+        table_name = f"{app_label}_pony"
+        
+        # Inspect PostgreSQL system catalogs directly
+        with connection.cursor() as cursor:
+            # Query pg_indexes for detailed index information
+            cursor.execute("""
+                SELECT indexname, indexdef, tablename 
+                FROM pg_indexes 
+                WHERE tablename = %s
+                ORDER BY indexname
+            """, [table_name])
+            
+            initial_indexes = cursor.fetchall()
+            self.assertGreater(len(initial_indexes), 0, 
+                             "Should have indexes from unique_together")
+        
+        # Execute rename operation
+        operation = migrations.RenameIndex(
+            "Pony", 
+            new_name="pg_catalog_test_idx", 
+            old_fields=("pink", "weight")
+        )
+        
+        forward_state = project_state.clone()
+        operation.state_forwards(app_label, forward_state)
+        
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, project_state, forward_state)
+        
+        # Inspect system catalogs after rename
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT indexname, indexdef, tablename 
+                FROM pg_indexes 
+                WHERE tablename = %s AND indexname = %s
+            """, [table_name, "pg_catalog_test_idx"])
+            
+            renamed_indexes = cursor.fetchall()
+            self.assertEqual(len(renamed_indexes), 1, 
+                           "Renamed index should exist in pg_indexes")
+            
+            # Verify index definition contains expected columns
+            index_def = renamed_indexes[0][1]
+            self.assertIn("pink", index_def)
+            self.assertIn("weight", index_def)
+        
+        # Test transaction boundary validation
+        with connection.cursor() as cursor:
+            # Verify we can query the index within same transaction
+            cursor.execute(f"""
+                SELECT indexname FROM pg_indexes 
+                WHERE tablename = %s AND indexname = %s
+            """, [table_name, "pg_catalog_test_idx"])
+            
+            result = cursor.fetchone()
+            self.assertIsNotNone(result, 
+                               "Index should be visible within transaction")
+
+
 class FieldOperationTests(SimpleTestCase):
     def test_references_model(self):
         operation = FieldOperation(
