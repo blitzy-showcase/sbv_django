@@ -70,194 +70,188 @@ class NoMigrationFoodManager(BaseFoodManager.from_queryset(FoodQuerySet)):
     pass
 
 
-# Test models with unique_together constraints for RenameIndex operation testing
-# These models generate unnamed indexes that need proper handling during rename operations
+# Test models for RenameIndex operations with unique_together constraints
+# These models generate unnamed indexes that are used to test RenameIndex
+# forward/backward migration cycles and unnamed index detection/restoration
+
 
 class UniqueTogetherTestModel(models.Model):
     """
-    Test model featuring multiple unique_together constraint combinations.
-    Generates unnamed indexes to test various unnamed index generation patterns
-    used in RenameIndex testing scenarios.
+    Test model with multiple unique_together constraint combinations to test
+    various unnamed index generation patterns used in RenameIndex testing scenarios.
     """
     title = models.CharField(max_length=100)
-    slug = models.SlugField(max_length=100)
+    code = models.CharField(max_length=20)
     category = models.CharField(max_length=50)
-    status = models.CharField(max_length=20)
-    created_at = models.DateTimeField(auto_now_add=True)
-    
+    status = models.IntegerField(default=1)
+    created_date = models.DateField(auto_now_add=True)
+
     class Meta:
         # Disable auto loading of this model as we load it on our own
         apps = Apps()
-        # Multiple unique_together combinations that generate unnamed indexes
+        # Multiple unique_together constraints that generate unnamed indexes
         unique_together = [
-            ('title', 'category'),
-            ('slug', 'status'),
-            ('category', 'status', 'created_at'),
+            ('title', 'code'),          # Basic two-field unique constraint
+            ('category', 'status'),     # Status code with category constraint
+            ('title', 'category', 'status'),  # Three-field complex constraint
         ]
 
 
 class ComplexConstraintModel(models.Model):
     """
-    Test model with mixed unique_together and explicit index definitions.
-    Used to validate proper detection and handling of auto-generated versus
-    explicitly named indexes during RenameIndex operations.
+    Test model with mixed unique_together and explicit index definitions to validate
+    proper detection and handling of auto-generated versus explicitly named indexes.
     """
-    name = models.CharField(max_length=100)
-    code = models.CharField(max_length=20)
-    email = models.EmailField()
-    department = models.CharField(max_length=50)
-    level = models.IntegerField()
-    active = models.BooleanField(default=True)
-    
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=200)
+    department_code = models.CharField(max_length=10)
+    priority = models.PositiveIntegerField()
+    is_active = models.BooleanField(default=True)
+    version = models.CharField(max_length=20)
+
     class Meta:
-        # Disable auto loading of this model as we load it on our own
         apps = Apps()
-        # Mix of unnamed (unique_together) and named constraints
+        # Mix of unique_together (generates unnamed indexes) and explicit indexes
         unique_together = [
-            ('name', 'department'),
-            ('code', 'level'),
+            ('name', 'department_code'),    # Unnamed index from unique_together
+            ('slug', 'version'),            # Another unnamed index
         ]
         indexes = [
             # Explicitly named index for comparison with unnamed ones
-            models.Index(fields=['email'], name='explicit_email_idx'),
-            models.Index(fields=['department', 'active'], name='explicit_dept_active_idx'),
+            models.Index(fields=['priority', 'is_active'], name='explicit_priority_active_idx'),
         ]
 
 
 class MultiFieldUniqueModel(models.Model):
     """
-    Test model with complex unique_together constraints spanning multiple field types.
-    Tests comprehensive index name generation and restoration logic across
-    different PostgreSQL column types and constraint patterns.
+    Test model with complex unique_together constraints spanning multiple field types
+    to test comprehensive index name generation and restoration logic.
     """
-    string_field = models.CharField(max_length=200)
-    integer_field = models.IntegerField()
-    decimal_field = models.DecimalField(max_digits=10, decimal_places=2)
+    identifier = models.CharField(max_length=50)
+    numeric_code = models.IntegerField()
+    decimal_value = models.DecimalField(max_digits=10, decimal_places=2)
+    text_field = models.TextField()
+    url_field = models.URLField()
+    email_field = models.EmailField()
     date_field = models.DateField()
     datetime_field = models.DateTimeField()
-    boolean_field = models.BooleanField()
-    text_field = models.TextField()
-    foreign_key_field = models.ForeignKey(
-        'UniqueTogetherTestModel', 
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True
-    )
-    
+    boolean_field = models.BooleanField(default=False)
+
     class Meta:
-        # Disable auto loading of this model as we load it on our own
         apps = Apps()
         # Complex unique_together constraints with various field types
         unique_together = [
-            ('string_field', 'integer_field'),
-            ('decimal_field', 'date_field', 'boolean_field'),
-            ('datetime_field', 'foreign_key_field'),
-            ('string_field', 'text_field', 'integer_field'),
+            ('identifier', 'numeric_code'),                    # String + Integer
+            ('decimal_value', 'boolean_field'),                # Decimal + Boolean  
+            ('email_field', 'date_field'),                     # Email + Date
+            ('url_field', 'datetime_field', 'boolean_field'),  # URL + DateTime + Boolean
+            ('identifier', 'text_field', 'numeric_code'),      # Mixed types constraint
         ]
 
 
 class PostgreSQLSpecificTestModel(models.Model):
     """
-    Test model with PostgreSQL-specific field types and constraint patterns.
-    Supports PostgreSQL-specific testing scenarios including different column types
-    and constraint patterns that generate various auto-generated index naming patterns.
+    Test model with PostgreSQL-specific field types and constraint patterns
+    that generate various auto-generated index naming patterns.
     """
-    uuid_field = models.UUIDField(null=True, blank=True)
+    uuid_field = models.UUIDField()
     json_field = models.JSONField(default=dict)
-    array_field = models.CharField(max_length=100)  # Simulated array field
-    inet_field = models.GenericIPAddressField(null=True, blank=True)
-    big_integer_field = models.BigIntegerField()
-    small_integer_field = models.SmallIntegerField()
-    positive_integer_field = models.PositiveIntegerField()
-    float_field = models.FloatField()
-    duration_field = models.DurationField(null=True, blank=True)
-    
+    array_field = models.CharField(max_length=100)  # Would be ArrayField in real PostgreSQL usage
+    inet_address = models.GenericIPAddressField()
+    big_integer = models.BigIntegerField()
+    small_integer = models.SmallIntegerField()
+    positive_big_integer = models.PositiveBigIntegerField()
+    duration_field = models.DurationField()
+    binary_field = models.BinaryField()
+
     class Meta:
-        # Disable auto loading of this model as we load it on our own
         apps = Apps()
-        # PostgreSQL-specific constraint combinations
+        # PostgreSQL-specific unique_together patterns
         unique_together = [
-            ('uuid_field', 'big_integer_field'),
-            ('inet_field', 'small_integer_field', 'positive_integer_field'),
-            ('float_field', 'duration_field'),
-            ('array_field', 'json_field'),
+            ('uuid_field', 'inet_address'),                      # UUID + IP constraint
+            ('big_integer', 'small_integer'),                    # Different integer types
+            ('json_field', 'array_field'),                       # JSON + Array constraint
+            ('positive_big_integer', 'duration_field'),          # Positive BigInt + Duration
+            ('uuid_field', 'big_integer', 'inet_address'),      # Complex multi-type constraint
         ]
 
 
-class SimpleUniqueModel(models.Model):
+class MigrationStateTrackerModel(models.Model):
     """
-    Simple test model with basic unique_together constraint.
-    Provides baseline testing for Migration State Tracker component
-    with predictable unique_together constraint configurations.
+    Test model with predictable unique_together constraint configurations
+    to support Migration State Tracker component testing.
     """
-    field_a = models.CharField(max_length=50)
-    field_b = models.CharField(max_length=50)
-    
+    tracker_id = models.CharField(max_length=100)
+    state_name = models.CharField(max_length=50)
+    sequence_number = models.IntegerField()
+    checkpoint_data = models.TextField()
+    timestamp = models.DateTimeField()
+    is_checkpoint = models.BooleanField(default=False)
+
     class Meta:
-        # Disable auto loading of this model as we load it on our own
         apps = Apps()
-        unique_together = [('field_a', 'field_b')]
-
-
-class ThreeFieldUniqueModel(models.Model):
-    """
-    Test model with three-field unique_together constraint.
-    Tests migration state tracking with multi-field unnamed index scenarios.
-    """
-    field_x = models.CharField(max_length=30)
-    field_y = models.IntegerField()
-    field_z = models.BooleanField()
-    
-    class Meta:
-        # Disable auto loading of this model as we load it on our own
-        apps = Apps()
-        unique_together = [('field_x', 'field_y', 'field_z')]
-
-
-class MixedConstraintTestModel(models.Model):
-    """
-    Test model combining various constraint types to validate proper
-    unnamed index detection in complex scenarios with multiple constraint types.
-    """
-    primary_field = models.CharField(max_length=100)
-    secondary_field = models.CharField(max_length=100)
-    tertiary_field = models.CharField(max_length=100)
-    numeric_field = models.IntegerField()
-    flag_field = models.BooleanField(default=False)
-    
-    class Meta:
-        # Disable auto loading of this model as we load it on our own
-        apps = Apps()
-        # Multiple unique_together constraints of different sizes
+        # Predictable unique_together configurations for state tracking tests
         unique_together = [
-            ('primary_field', 'secondary_field'),
-            ('tertiary_field', 'numeric_field', 'flag_field'),
-            ('primary_field', 'tertiary_field'),
+            ('tracker_id', 'sequence_number'),          # Sequence uniqueness per tracker
+            ('state_name', 'checkpoint_data'),          # State name + data uniqueness
+            ('tracker_id', 'timestamp', 'is_checkpoint'),  # Temporal uniqueness constraint
+        ]
+
+
+class ForeignKeyUniqueTogetherModel(models.Model):
+    """
+    Test model with ForeignKey fields in unique_together constraints
+    to test index generation patterns with relational constraints.
+    """
+    related_unicode = models.ForeignKey(UnicodeModel, on_delete=models.CASCADE)
+    related_unserializable = models.ForeignKey(UnserializableModel, on_delete=models.CASCADE)
+    description = models.CharField(max_length=200)
+    reference_code = models.CharField(max_length=50)
+    priority_level = models.PositiveIntegerField()
+
+    class Meta:
+        apps = Apps()
+        # unique_together with ForeignKey fields generates specific index patterns
+        unique_together = [
+            ('related_unicode', 'reference_code'),              # FK + CharField constraint
+            ('related_unserializable', 'priority_level'),      # FK + Integer constraint
+            ('related_unicode', 'related_unserializable'),     # Multiple FK constraint
+            ('description', 'reference_code', 'priority_level'),  # Non-FK multi-field
         ]
 
 
 class EdgeCaseUniqueModel(models.Model):
     """
-    Test model for edge cases in unique_together constraint handling.
-    Tests scenarios with nullable fields, foreign keys, and special character handling
-    in auto-generated index names.
+    Test model for edge cases in unique_together constraint handling
+    during RenameIndex operations.
     """
-    # Fields with special characters that may affect index naming
-    field_with_underscore = models.CharField(max_length=50)
-    field_with_number_123 = models.CharField(max_length=50) 
-    nullable_field = models.CharField(max_length=50, null=True, blank=True)
-    foreign_key_nullable = models.ForeignKey(
-        'SimpleUniqueModel',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True
-    )
+    # Fields that might cause edge cases in index naming
+    field_with_underscores = models.CharField(max_length=100)
+    field_with_numbers123 = models.IntegerField()
+    very_long_field_name_that_might_cause_truncation_issues = models.CharField(max_length=50)
+    field_with_special_chars = models.CharField(max_length=100)  # Would test special char handling
     
     class Meta:
-        # Disable auto loading of this model as we load it on our own
         apps = Apps()
-        # Edge case constraints with nullable and foreign key fields
+        # Edge case unique_together patterns for testing robustness
         unique_together = [
-            ('field_with_underscore', 'field_with_number_123'),
-            ('nullable_field', 'foreign_key_nullable'),
+            ('field_with_underscores', 'field_with_numbers123'),  # Underscore + numeric
+            ('very_long_field_name_that_might_cause_truncation_issues', 'field_with_special_chars'),  # Long names
+            ('field_with_underscores', 'very_long_field_name_that_might_cause_truncation_issues', 'field_with_numbers123'),  # Complex edge case
+        ]
+
+
+class SimpleUniqueTogetherModel(models.Model):
+    """
+    Simplified test model for basic RenameIndex operation validation
+    with minimal unique_together constraints.
+    """
+    name = models.CharField(max_length=100)
+    code = models.CharField(max_length=20)
+
+    class Meta:
+        apps = Apps()
+        # Single simple unique_together constraint for basic testing
+        unique_together = [
+            ('name', 'code'),
         ]
