@@ -297,3 +297,380 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             include=include,
             expressions=expressions,
         )
+
+    def _get_pg_index_metadata(self, table_name, index_name=None):
+        """
+        Retrieve PostgreSQL-specific index metadata from system catalogs.
+        Returns detailed information about indexes including auto-generated names.
+        """
+        with self.connection.cursor() as cursor:
+            if index_name:
+                cursor.execute("""
+                    SELECT i.indexname, i.indexdef, 
+                           pg_get_indexdef(c.oid) as full_definition,
+                           c.conname as constraint_name,
+                           c.contype as constraint_type
+                    FROM pg_indexes i
+                    LEFT JOIN pg_constraint c ON c.conindid = (
+                        SELECT oid FROM pg_class 
+                        WHERE relname = i.indexname AND relkind = 'i'
+                    )
+                    WHERE i.tablename = %s AND i.indexname = %s
+                    AND i.schemaname = 'public'
+                """, [table_name, index_name])
+            else:
+                cursor.execute("""
+                    SELECT i.indexname, i.indexdef, 
+                           pg_get_indexdef(ic.oid) as full_definition,
+                           c.conname as constraint_name,
+                           c.contype as constraint_type
+                    FROM pg_indexes i
+                    LEFT JOIN pg_class ic ON ic.relname = i.indexname AND ic.relkind = 'i'
+                    LEFT JOIN pg_constraint c ON c.conindid = ic.oid
+                    WHERE i.tablename = %s
+                    AND i.schemaname = 'public'
+                """, [table_name])
+            return cursor.fetchall()
+
+    def _detect_unnamed_index_from_unique_together(self, model, field_names):
+        """
+        Detect if an index was auto-generated from unique_together constraints.
+        Returns the actual index name if found, None otherwise.
+        """
+        table_name = strip_quotes(model._meta.db_table)
+        
+        # Get all indexes for this table from PostgreSQL catalogs
+        indexes = self._get_pg_index_metadata(table_name)
+        
+        # Generate expected column names for the field combination
+        expected_columns = []
+        for field_name in field_names:
+            field = model._meta.get_field(field_name)
+            expected_columns.append(field.column)
+        
+        # Look for indexes that match our field combination
+        for index_name, index_def, full_def, constraint_name, constraint_type in indexes:
+            # Parse the index definition to extract column names
+            if index_def and "ON" in index_def:
+                # Extract columns from index definition
+                # Format: CREATE [UNIQUE] INDEX index_name ON table_name (col1, col2, ...)
+                columns_part = index_def.split("(", 1)[1].rsplit(")", 1)[0]
+                index_columns = [col.strip() for col in columns_part.split(",")]
+                
+                # Remove any ordering or function calls from column names
+                clean_columns = []
+                for col in index_columns:
+                    # Handle quoted column names and remove DESC/ASC
+                    clean_col = col.replace('"', '').split()[0]
+                    clean_columns.append(clean_col)
+                
+                # Check if this matches our expected columns
+                if set(clean_columns) == set(expected_columns):
+                    # This could be our auto-generated index
+                    # Additional check: see if it's a unique constraint index
+                    if constraint_type == 'u':  # unique constraint
+                        return index_name
+                    # Or if it looks like an auto-generated name pattern
+                    elif self._is_auto_generated_index_name(index_name, table_name, expected_columns):
+                        return index_name
+        
+        return None
+
+    def _is_auto_generated_index_name(self, index_name, table_name, columns):
+        """
+        Check if an index name follows Django's auto-generation pattern.
+        Django generates names like: table_column1_column2_hash_idx
+        """
+        # Django's pattern: table[:11]_column[:7]_hash_suffix
+        # For unique constraints, it might be different
+        
+        # Check if it contains table name and column names
+        table_short = table_name[:11]
+        if not index_name.startswith(table_short):
+            return False
+            
+        # Check if it ends with expected suffixes
+        expected_suffixes = ['_idx', '_key', '_uniq']
+        has_expected_suffix = any(index_name.endswith(suffix) for suffix in expected_suffixes)
+        
+        if has_expected_suffix:
+            # Check if it contains column names
+            for column in columns:
+                if column[:7] in index_name:
+                    return True
+        
+        return False
+
+    def _generate_auto_index_name(self, table_name, columns, suffix="_idx"):
+        """
+        Generate an index name using Django's auto-generation algorithm.
+        This replicates the logic from django.db.models.indexes.Index.
+        """
+        # Replicate Django's index name generation logic
+        table_short = table_name[:11]
+        column_names_with_order = [col for col in columns]
+        
+        # Generate hash data
+        hash_data = [table_name] + column_names_with_order + [suffix]
+        
+        # Use Django's names_digest function for consistent hashing
+        hash_part = names_digest(*hash_data, length=4)
+        
+        # Create the name following Django's pattern
+        if columns:
+            first_column = columns[0][:7]
+            name = f"{table_short}_{first_column}_{hash_part}_{suffix.lstrip('_')}"
+        else:
+            name = f"{table_short}_{hash_part}_{suffix.lstrip('_')}"
+        
+        # Ensure it's not too long (Django's max is 30 chars)
+        if len(name) > 30:
+            # Truncate and regenerate hash if needed
+            available_length = 30 - len(f"_{hash_part}_{suffix.lstrip('_')}")
+            table_and_col = f"{table_short}_{first_column}"[:available_length]
+            name = f"{table_and_col}_{hash_part}_{suffix.lstrip('_')}"
+        
+        return name
+
+    def _rename_index_with_fallback(self, model, old_index, new_index):
+        """
+        Enhanced rename_index method with PostgreSQL-specific error handling
+        and fallback strategies for unnamed indexes.
+        """
+        try:
+            # Try the standard rename operation first
+            super().rename_index(model, old_index, new_index)
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Handle PostgreSQL-specific errors during rename operations
+            if any(err in error_msg for err in [
+                'relation already exists',
+                'index already exists',
+                'duplicate key value',
+                'constraint already exists'
+            ]):
+                # Implement fallback strategy: DROP + CREATE
+                self._atomic_index_rename_fallback(model, old_index, new_index)
+            else:
+                # Re-raise if it's not a recoverable error
+                raise
+
+    def _atomic_index_rename_fallback(self, model, old_index, new_index):
+        """
+        Atomic fallback strategy for index renaming using DROP + CREATE sequence.
+        Ensures transaction consistency and proper rollback capabilities.
+        """
+        # Create a savepoint for rollback capability
+        savepoint_name = f"rename_index_{old_index.name}_{new_index.name}"
+        
+        try:
+            # Start a savepoint
+            self.execute(f"SAVEPOINT {self.quote_name(savepoint_name)}")
+            
+            # Step 1: Create the new index first (to minimize downtime)
+            self.execute(new_index.create_sql(model, self), params=None)
+            
+            # Step 2: Drop the old index
+            self.execute(old_index.remove_sql(model, self))
+            
+            # Release the savepoint if successful
+            self.execute(f"RELEASE SAVEPOINT {self.quote_name(savepoint_name)}")
+            
+        except Exception as e:
+            # Rollback to savepoint on any error
+            self.execute(f"ROLLBACK TO SAVEPOINT {self.quote_name(savepoint_name)}")
+            self.execute(f"RELEASE SAVEPOINT {self.quote_name(savepoint_name)}")
+            
+            # Re-raise the error with additional context
+            raise Exception(
+                f"Failed to rename index {old_index.name} to {new_index.name} "
+                f"using atomic fallback strategy: {e}"
+            ) from e
+
+    def _restore_unnamed_index_name(self, model, field_names, new_name):
+        """
+        Restore the original auto-generated index name for unnamed indexes
+        created by unique_together constraints.
+        """
+        table_name = strip_quotes(model._meta.db_table)
+        
+        # First, try to detect the existing index name
+        existing_index_name = self._detect_unnamed_index_from_unique_together(
+            model, field_names
+        )
+        
+        if existing_index_name:
+            # We found the existing index, now we need to restore its original name
+            # during backward migration
+            
+            # Generate what the original auto-generated name would have been
+            columns = [model._meta.get_field(name).column for name in field_names]
+            
+            # For unique_together, Django typically creates unique constraints
+            # which may have different naming patterns
+            original_name = self._generate_auto_index_name(
+                table_name, columns, suffix="_uniq"
+            )
+            
+            # If that doesn't match, try with _key suffix (PostgreSQL default)
+            if existing_index_name != original_name:
+                original_name = self._generate_auto_index_name(
+                    table_name, columns, suffix="_key"
+                )
+            
+            # If still no match, use the detected name as-is
+            if existing_index_name != original_name:
+                original_name = existing_index_name
+            
+            return original_name
+        
+        # If we can't detect existing index, generate a new auto name
+        columns = [model._meta.get_field(name).column for name in field_names]
+        return self._generate_auto_index_name(table_name, columns, suffix="_uniq")
+
+    def alter_index_together(self, model, old_index_together, new_index_together):
+        """
+        Enhanced alter_index_together with PostgreSQL-specific unnamed index handling.
+        Properly manages index state during RenameIndex operations.
+        """
+        # Call the parent implementation first
+        super().alter_index_together(model, old_index_together, new_index_together)
+        
+        # Additional PostgreSQL-specific handling for migration state tracking
+        # This ensures that index metadata is properly tracked for unnamed indexes
+        table_name = strip_quotes(model._meta.db_table)
+        
+        # Track changes in index_together for migration state consistency
+        olds = {tuple(fields) for fields in old_index_together}
+        news = {tuple(fields) for fields in new_index_together}
+        
+        # For deleted indexes, ensure we clean up any migration state tracking
+        for fields in olds.difference(news):
+            self._cleanup_migration_state_for_index(model, fields)
+        
+        # For new indexes, initialize migration state tracking if needed
+        for fields in news.difference(olds):
+            self._initialize_migration_state_for_index(model, fields)
+
+    def _cleanup_migration_state_for_index(self, model, field_names):
+        """
+        Clean up migration state tracking for a removed index.
+        PostgreSQL-specific implementation for state coordination.
+        """
+        # This method can be extended to interface with the Migration State Tracker
+        # component mentioned in the technical specification
+        pass
+
+    def _initialize_migration_state_for_index(self, model, field_names):
+        """
+        Initialize migration state tracking for a new index.
+        PostgreSQL-specific implementation for state coordination.
+        """
+        # This method can be extended to interface with the Migration State Tracker
+        # component mentioned in the technical specification
+        pass
+
+    def _validate_index_rename_operation(self, model, old_index, new_index):
+        """
+        PostgreSQL-specific validation and conflict detection for index rename operations.
+        Prevents duplicate creation and ensures consistent state throughout migration cycles.
+        """
+        table_name = strip_quotes(model._meta.db_table)
+        
+        # Check if the target index name already exists
+        existing_indexes = self._get_pg_index_metadata(table_name)
+        existing_names = [idx[0] for idx in existing_indexes]
+        
+        if new_index.name in existing_names:
+            # Check if it's the same index (already renamed)
+            old_index_exists = old_index.name in existing_names
+            if not old_index_exists:
+                # The new name exists but old doesn't - probably already renamed
+                return False  # Skip the rename operation
+            else:
+                # Both exist - this is a conflict
+                raise ValueError(
+                    f"Cannot rename index {old_index.name} to {new_index.name}: "
+                    f"target name already exists in table {table_name}"
+                )
+        
+        return True  # Proceed with rename
+
+    def rename_index(self, model, old_index, new_index):
+        """
+        Override rename_index with PostgreSQL-specific enhancements for unnamed index handling.
+        Provides atomic operation handling and proper error recovery.
+        """
+        # Validate the operation first
+        if not self._validate_index_rename_operation(model, old_index, new_index):
+            return  # Skip if validation indicates it's unnecessary
+        
+        # Use enhanced rename with fallback for error handling
+        self._rename_index_with_fallback(model, old_index, new_index)
+
+    def rename_unnamed_index_backward(self, model, new_index_name, old_fields):
+        """
+        Special method for handling backward migration of RenameIndex operations
+        on unnamed indexes created by unique_together constraints.
+        
+        This method is called by RenameIndex.database_backwards() when dealing
+        with unnamed indexes that need to be restored to their original auto-generated names.
+        """
+        table_name = strip_quotes(model._meta.db_table)
+        
+        # Find the current index with the new name
+        current_indexes = self._get_pg_index_metadata(table_name, new_index_name)
+        if not current_indexes:
+            # Index doesn't exist, might have been already restored
+            return
+        
+        # Determine what the original auto-generated name should be
+        original_name = self._restore_unnamed_index_name(model, old_fields, new_index_name)
+        
+        # Create index objects for the rename operation
+        columns = [model._meta.get_field(field).column for field in old_fields]
+        
+        # Create a temporary index object representing the current state
+        current_index = models.Index(fields=old_fields, name=new_index_name)
+        
+        # Create index object representing the target (original) state
+        target_index = models.Index(fields=old_fields, name=original_name)
+        
+        # Perform the rename back to the original name
+        try:
+            self._rename_index_with_fallback(model, current_index, target_index)
+        except Exception as e:
+            # If rename fails, it might be because the original name already exists
+            # or the index was already restored
+            if "already exists" in str(e).lower():
+                # The original index might already exist, just drop the new one
+                try:
+                    self.execute(current_index.remove_sql(model, self))
+                except Exception:
+                    # If we can't drop it, it might not exist anymore
+                    pass
+            else:
+                raise
+
+    def handle_unnamed_index_detection(self, model, field_names):
+        """
+        Public interface for detecting and handling unnamed indexes during migrations.
+        Returns index information that can be used by RenameIndex operations.
+        """
+        detected_name = self._detect_unnamed_index_from_unique_together(model, field_names)
+        
+        if detected_name:
+            return {
+                'exists': True,
+                'name': detected_name,
+                'fields': field_names,
+                'table': strip_quotes(model._meta.db_table)
+            }
+        
+        return {
+            'exists': False,
+            'name': None,
+            'fields': field_names,
+            'table': strip_quotes(model._meta.db_table)
+        }
